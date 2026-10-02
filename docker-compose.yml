@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: caltrace-db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-caltrace}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-caltrace}
+      POSTGRES_DB: ${POSTGRES_DB:-caltrace}
+    volumes:
+      # 仅当数据卷为空时，PostgreSQL 官方镜像会自动执行该初始化脚本
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - caltrace-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-caltrace} -d ${POSTGRES_DB:-caltrace}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    # 宿主机映射端口；可用环境变量 POSTGRES_PORT 覆盖（默认不对外暴露，仅服务内网互通）
+    ports:
+      - "${POSTGRES_PORT:-127.0.0.1:5432}:5432"
+
+  api:
+    build: .
+    container_name: caltrace-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # 指向 compose 网络内的数据库服务
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-caltrace}
+      DB_USER: ${POSTGRES_USER:-caltrace}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-caltrace}
+      APP_PORT: 8080
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    restart: unless-stopped
+
+volumes:
+  caltrace-pgdata:
