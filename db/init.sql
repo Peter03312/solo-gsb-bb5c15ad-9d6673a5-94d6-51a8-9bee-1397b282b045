@@ -23,6 +23,26 @@ CREATE TYPE cert_status AS ENUM ('ACTIVE', 'REVOKED', 'INVALID');
 CREATE TYPE cert_conclusion AS ENUM ('PASS', 'FAIL');
 
 -- ----------------------------------------------------------------------------
+-- 交接批次表：一组实验室离线校准记录整批签发的幂等单元
+--
+-- 签发开始即插入占位行（result_snapshot 为 NULL 表示进行中），
+-- 全部证书与校验通过后在同一事务写入结果快照；
+-- 校验失败或崩溃则整批回滚，连占位行一并消失。
+--   * batch_key     客户端提供的唯一批次键（同键重试返回首次结果）
+--   * request_hash  请求指纹（与首次不同则 409 issue_batch_conflict）
+--   * request_body  首次请求的规范化快照（用于排查冲突）
+--   * result_snapshot 首次成功响应的完整快照（即使证书后来被撤销也原样返回）
+-- ----------------------------------------------------------------------------
+CREATE TABLE issue_batches (
+    batch_key       TEXT PRIMARY KEY,
+    request_hash    TEXT NOT NULL,
+    request_body    JSONB NOT NULL,
+    result_snapshot JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    issued_at       TIMESTAMPTZ
+);
+
+-- ----------------------------------------------------------------------------
 -- 证书主表
 -- ----------------------------------------------------------------------------
 CREATE TABLE certificates (
@@ -40,7 +60,9 @@ CREATE TABLE certificates (
     status         cert_status   NOT NULL DEFAULT 'ACTIVE',
     revoked_reason TEXT,                             -- 撤销原因（撤销时写入）
     revoked_at     TIMESTAMPTZ,                      -- 撤销/级联失效时刻
-    created_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    -- 若证书经由“交接批次”整批签发，记录所属批次键；单张签发时为 NULL
+    issue_batch_key TEXT REFERENCES issue_batches(batch_key) ON DELETE RESTRICT
 );
 
 -- 基本完整性约束
@@ -61,6 +83,7 @@ CREATE INDEX idx_cert_device   ON certificates(device_id);
 CREATE INDEX idx_cert_parent   ON certificates(parent_cert_no);
 CREATE INDEX idx_cert_status   ON certificates(status);
 CREATE INDEX idx_cert_created  ON certificates(created_at);
+CREATE INDEX idx_cert_batch    ON certificates(issue_batch_key);
 
 -- 同一设备“生效中(ACTIVE)”证书的有效期不得重叠。
 -- 采用半开区间 [valid_from, valid_to)：首尾相接不算重叠。
@@ -117,6 +140,7 @@ BEGIN
        OR NEW.operator       IS DISTINCT FROM OLD.operator
        OR NEW.remark         IS DISTINCT FROM OLD.remark
        OR NEW.created_at     IS DISTINCT FROM OLD.created_at
+       OR NEW.issue_batch_key IS DISTINCT FROM OLD.issue_batch_key
     THEN
         RAISE EXCEPTION 'certificate % is sealed: issued content cannot be modified', OLD.cert_no
             USING ERRCODE = 'check_violation';
@@ -150,6 +174,36 @@ CREATE TRIGGER trg_certificates_no_delete
     FOR EACH ROW EXECUTE FUNCTION certificates_no_delete();
 
 -- ----------------------------------------------------------------------------
+-- 触发器 3：交接批次一经签发即固化
+-- 仅允许占位行（result_snapshot IS NULL）在同一签发事务中写入一次结果；
+-- 已完成批次禁止任何 UPDATE/DELETE，保证“同键重试永远返回首次结果”。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION issue_batches_sealed() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'issue batch % cannot be deleted', OLD.batch_key
+            USING ERRCODE = 'check_violation';
+    END IF;
+    -- UPDATE：仅放行“进行中占位行 → 写入结果”这一次状态变化
+    IF OLD.result_snapshot IS NOT NULL
+       OR NEW.result_snapshot IS NULL
+       OR NEW.batch_key IS DISTINCT FROM OLD.batch_key
+       OR NEW.request_hash IS DISTINCT FROM OLD.request_hash
+       OR NEW.request_body IS DISTINCT FROM OLD.request_body
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'issue batch % is sealed: first issued result is immutable',
+            OLD.batch_key USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_issue_batches_sealed
+    BEFORE UPDATE OR DELETE ON issue_batches
+    FOR EACH ROW EXECUTE FUNCTION issue_batches_sealed();
+
+-- ----------------------------------------------------------------------------
 -- 查询视图：统一将枚举以文本形式暴露给应用层
 -- ----------------------------------------------------------------------------
 CREATE VIEW v_certificates AS
@@ -167,5 +221,6 @@ SELECT cert_no,
        status::text        AS status,
        revoked_reason,
        revoked_at,
-       created_at
+       created_at,
+       issue_batch_key
 FROM certificates;

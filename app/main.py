@@ -65,6 +65,9 @@ def index():
         "openapi": "/openapi.json",
         "api_base": "/api/v1",
         "endpoints": [
+            "POST /api/v1/issue-batches",
+            "GET  /api/v1/issue-batches",
+            "GET  /api/v1/issue-batches/{batch_key}",
             "POST /api/v1/reference-certificates",
             "POST /api/v1/certificates",
             "GET  /api/v1/certificates",

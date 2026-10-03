@@ -1,6 +1,9 @@
 """HTTP API 路由。
 
 约定：
+- POST   /api/v1/issue-batches                   交接批次整批签发（批次键幂等）
+- GET    /api/v1/issue-batches                   已签发交接批次列表
+- GET    /api/v1/issue-batches/{batch_key}       交接批次详情（含各证书当前追溯链）
 - POST   /api/v1/reference-certificates        登记基准设备合格证书（追溯起点）
 - POST   /api/v1/certificates                  签发普通校准证书
 - GET    /api/v1/certificates                  证书列表（可按设备/状态/类型过滤）
@@ -14,12 +17,14 @@
 """
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from psycopg_pool import ConnectionPool
 
 from . import repository as repo
 from .schemas import (
     CertificateIssueRequest,
+    IssueBatchRequest,
+    IssueBatchResponse,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -29,6 +34,44 @@ router = APIRouter(prefix="/api/v1")
 
 def pool_dep(request: Request) -> ConnectionPool:
     return request.app.state.pool
+
+
+@router.post(
+    "/issue-batches",
+    status_code=201,
+    response_model=IssueBatchResponse,
+    responses={
+        200: {"description": "同键同请求重试：返回首次签发结果（响应头 "
+                             "Idempotency-Replayed: true，体内 replayed=true）"},
+        409: {"description": "issue_batch_conflict 同键不同请求 / "
+                             "issue_batch_concurrent 与并发签发撤销冲突"},
+        422: {"description": "batch_validation_failed 批内存在不合规记录，整批不落库"},
+    },
+)
+def issue_batch(req: IssueBatchRequest, response: Response, pool: ConnectionPool = Depends(pool_dep)):
+    with pool.connection() as conn:
+        body, replayed = repo.issue_batch(conn, req)
+    if replayed:
+        # 同键同请求重试：返回首次签发结果（200 + 重放标记），语义上不是新建
+        response.status_code = 200
+        response.headers["Idempotency-Replayed"] = "true"
+    return body
+
+
+@router.get("/issue-batches")
+def list_issue_batches(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    with pool.connection() as conn:
+        return repo.list_issue_batches(conn, limit, offset)
+
+
+@router.get("/issue-batches/{batch_key}")
+def get_issue_batch(batch_key: str, pool: ConnectionPool = Depends(pool_dep)):
+    with pool.connection() as conn:
+        return repo.get_issue_batch(conn, batch_key)
 
 
 @router.post("/reference-certificates", status_code=201)
