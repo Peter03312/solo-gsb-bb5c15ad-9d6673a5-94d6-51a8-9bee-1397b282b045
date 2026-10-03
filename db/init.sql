@@ -99,6 +99,21 @@ CREATE TABLE invalidations (
 );
 
 -- ----------------------------------------------------------------------------
+-- 签发批次表：离线采集交接批次的一次性签发记录
+-- batch_key 为幂等键；request/request_hash 为规范化请求快照及其指纹，
+-- response 为首次签发结果快照——同键同请求重试时原样返回（即使证书事后被撤销），
+-- 同键不同请求按 request_hash 判定为冲突。本表同样只增不改。
+-- ----------------------------------------------------------------------------
+CREATE TABLE issue_batches (
+    batch_key    TEXT PRIMARY KEY,                 -- 批次键（幂等键，业务唯一）
+    request_hash TEXT NOT NULL,                    -- 规范化请求的 SHA-256 指纹
+    request      JSONB NOT NULL,                   -- 规范化请求快照
+    response     JSONB NOT NULL,                   -- 首次签发结果快照（重试原样返回）
+    cert_nos     TEXT[] NOT NULL,                  -- 本批签发的证书编号（按请求顺序）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ----------------------------------------------------------------------------
 -- 触发器 1：证书签发内容不可改写
 -- 仅允许 status / revoked_reason / revoked_at 在撤销事务中变化；
 -- 其余业务字段（编号、设备、时间、结论、引用关系等）一律拒绝 UPDATE。

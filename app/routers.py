@@ -3,6 +3,8 @@
 约定：
 - POST   /api/v1/reference-certificates        登记基准设备合格证书（追溯起点）
 - POST   /api/v1/certificates                  签发普通校准证书
+- POST   /api/v1/certificate-batches           批量签发交接批次（整批原子、批次键幂等）
+- GET    /api/v1/certificate-batches/{batch_key}  查询签发批次（首次签发结果快照）
 - GET    /api/v1/certificates                  证书列表（可按设备/状态/类型过滤）
 - GET    /api/v1/certificates/{cert_no}        证书详情（历史内容始终可查）
 - GET    /api/v1/certificates/{cert_no}/chain  完整追溯引用链
@@ -14,11 +16,12 @@
 """
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 from psycopg_pool import ConnectionPool
 
 from . import repository as repo
 from .schemas import (
+    BatchIssueRequest,
     CertificateIssueRequest,
     ReferenceIssueRequest,
     RevokeRequest,
@@ -41,6 +44,25 @@ def issue_reference(req: ReferenceIssueRequest, pool: ConnectionPool = Depends(p
 def issue_certificate(req: CertificateIssueRequest, pool: ConnectionPool = Depends(pool_dep)):
     with pool.connection() as conn:
         return repo.issue_certificate(conn, req)
+
+
+@router.post("/certificate-batches", status_code=201)
+def issue_certificate_batch(
+    req: BatchIssueRequest, response: Response, pool: ConnectionPool = Depends(pool_dep)
+):
+    """批量签发交接批次：整批原子落库；批次键幂等（重放返回 200 与首次相同的结果）。"""
+    with pool.connection() as conn:
+        body, created = repo.issue_batch(conn, req)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.get("/certificate-batches/{batch_key}")
+def get_certificate_batch(batch_key: str, pool: ConnectionPool = Depends(pool_dep)):
+    """按批次键查询首次签发结果（快照，不受事后撤销影响）。"""
+    with pool.connection() as conn:
+        return repo.get_issue_batch(conn, batch_key)
 
 
 @router.get("/certificates")

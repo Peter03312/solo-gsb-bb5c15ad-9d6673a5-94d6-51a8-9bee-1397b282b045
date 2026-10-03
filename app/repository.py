@@ -1,5 +1,11 @@
 """数据访问与核心业务规则（全部在数据库事务中执行）。"""
+import hashlib
+import heapq
+import json
+from datetime import date, datetime, timezone
+
 import psycopg
+from psycopg.types.json import Jsonb
 
 from .errors import ApiError
 
@@ -205,21 +211,28 @@ def _assert_no_overlap(conn, device_id: str, valid_from, valid_to, exclude_no: s
         )
 
 
+def _raw_insert_certificate(conn, *, kind: str, conclusion: str, parent_no: str | None, req) -> None:
+    """插入证书行；数据库层异常原样抛出，由调用方按场景转换。"""
+    conn.execute(
+        """
+        INSERT INTO certificates (
+            cert_no, kind, device_id, device_name, calibrated_at,
+            valid_from, valid_to, conclusion, parent_cert_no, operator, remark
+        ) VALUES (
+            %s, %s::cert_kind, %s, %s, %s, %s, %s, %s::cert_conclusion, %s, %s, %s
+        )
+        """,
+        (
+            req.cert_no, kind, req.device_id, req.device_name, req.calibrated_at,
+            req.valid_from, req.valid_to, conclusion, parent_no, req.operator, req.remark,
+        ),
+    )
+
+
 def _insert_certificate(conn, *, kind: str, conclusion: str, parent_no: str | None, req) -> dict:
     try:
-        conn.execute(
-            """
-            INSERT INTO certificates (
-                cert_no, kind, device_id, device_name, calibrated_at,
-                valid_from, valid_to, conclusion, parent_cert_no, operator, remark
-            ) VALUES (
-                %s, %s::cert_kind, %s, %s, %s, %s, %s, %s::cert_conclusion, %s, %s, %s
-            )
-            """,
-            (
-                req.cert_no, kind, req.device_id, req.device_name, req.calibrated_at,
-                req.valid_from, req.valid_to, conclusion, parent_no, req.operator, req.remark,
-            ),
+        _raw_insert_certificate(
+            conn, kind=kind, conclusion=conclusion, parent_no=parent_no, req=req
         )
     except psycopg.errors.UniqueViolation:
         raise ApiError(409, "cert_duplicate", f"证书编号已存在: {req.cert_no}")
@@ -261,6 +274,314 @@ def issue_reference(conn, req) -> dict:
         )
     chain = get_chain(conn, req.cert_no)
     return {"certificate": cert, "chain": chain}
+
+
+# ---------------------------------------------------------------------------
+# 批次签发（离线采集交接批次：整批原子落库、批次键幂等）
+# ---------------------------------------------------------------------------
+
+def _json_default(o):
+    if isinstance(o, (datetime, date)):
+        return o.isoformat()
+    return str(o)
+
+
+def _json_dumps(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, default=_json_default)
+
+
+def _canonical_request(req) -> tuple[str, dict]:
+    """规范化请求：排序键的紧凑 JSON 及其 SHA-256，用于“同键是否同请求”判定。"""
+    doc = req.model_dump(mode="json")
+    canonical = json.dumps(doc, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), doc
+
+
+def _get_issue_batch_row(conn, batch_key: str) -> dict | None:
+    return conn.execute(
+        "SELECT batch_key, request_hash, response, cert_nos, created_at "
+        "FROM issue_batches WHERE batch_key = %s",
+        (batch_key,),
+    ).fetchone()
+
+
+def _replay_or_conflict(existing: dict, batch_key: str, req_hash: str) -> dict:
+    """批次键已存在：同请求 → 重放首次签发结果快照；不同请求 → 409 冲突。"""
+    if existing["request_hash"] != req_hash:
+        raise ApiError(
+            409,
+            "batch_conflict",
+            f"批次键 {batch_key} 已用于一份内容不同的签发请求；"
+            "同一批次键只允许重放完全相同的请求",
+            details={"batch_key": batch_key},
+        )
+    return existing["response"]
+
+
+def _trace_cycle(by_no: dict, start: str) -> list[str]:
+    """沿批内父引用从 start 向上走，返回成环路径（首尾相接）。"""
+    seen: dict[str, int] = {}
+    path: list[str] = []
+    cur = start
+    while cur not in seen:
+        seen[cur] = len(path)
+        path.append(cur)
+        nxt = by_no[cur].parent_cert_no
+        if nxt not in by_no:  # 理论不可达（未出队节点必有批内父），兜底
+            return [start, start]
+        cur = nxt
+    return path[seen[cur]:] + [cur]
+
+
+def _topo_sort_batch(items: list) -> list:
+    """批内引用拓扑排序（父先子后，同层按编号排序保证确定性）；成环则拒绝。"""
+    by_no = {it.cert_no: it for it in items}
+    indeg = {it.cert_no: 0 for it in items}
+    children: dict[str, list[str]] = {it.cert_no: [] for it in items}
+    for it in items:
+        if it.kind == "CALIBRATION" and it.parent_cert_no in by_no:
+            indeg[it.cert_no] += 1
+            children[it.parent_cert_no].append(it.cert_no)
+    ready = [no for no, d in indeg.items() if d == 0]
+    heapq.heapify(ready)
+    ordered = []
+    while ready:
+        no = heapq.heappop(ready)
+        ordered.append(by_no[no])
+        for ch in children[no]:
+            indeg[ch] -= 1
+            if indeg[ch] == 0:
+                heapq.heappush(ready, ch)
+    if len(ordered) != len(items):
+        start = next(no for no, d in indeg.items() if d > 0)
+        cycle = _trace_cycle(by_no, start)
+        raise ApiError(
+            422,
+            "reference_cycle",
+            f"批内引用关系成环: {' -> '.join(cycle)}",
+            details={"cert_no": cycle[0], "cycle": cycle},
+        )
+    return ordered
+
+
+def _validate_batch(conn, req) -> list:
+    """整批预检：批内编号唯一、不与库内冲突、引用可解析、批内无环。
+
+    返回拓扑排序后的条目列表；任一不合规抛出 ApiError（整批不落库，
+    出错编号置于 details.cert_no）。
+    """
+    items = list(req.certificates)
+    # 1) 批内编号唯一
+    seen: set[str] = set()
+    for it in items:
+        if it.cert_no in seen:
+            raise ApiError(
+                422,
+                "batch_cert_duplicate",
+                f"批次内证书编号重复: {it.cert_no}",
+                details={"cert_no": it.cert_no},
+            )
+        seen.add(it.cert_no)
+    # 2) 不得与库内已有证书编号冲突
+    nos = [it.cert_no for it in items]
+    existing = {
+        r["cert_no"]
+        for r in conn.execute(
+            "SELECT cert_no FROM certificates WHERE cert_no = ANY(%s)", (nos,)
+        ).fetchall()
+    }
+    for it in items:
+        if it.cert_no in existing:
+            raise ApiError(
+                409,
+                "cert_duplicate",
+                f"证书编号已存在: {it.cert_no}（整批未签发）",
+                details={"cert_no": it.cert_no},
+            )
+    # 3) 引用解析：普通证书的上游必须在本批或库内
+    by_no = {it.cert_no: it for it in items}
+    ext_parents = sorted(
+        {
+            it.parent_cert_no
+            for it in items
+            if it.kind == "CALIBRATION" and it.parent_cert_no not in by_no
+        }
+    )
+    found = set()
+    if ext_parents:
+        found = {
+            r["cert_no"]
+            for r in conn.execute(
+                "SELECT cert_no FROM certificates WHERE cert_no = ANY(%s)",
+                (ext_parents,),
+            ).fetchall()
+        }
+    for it in items:
+        if (
+            it.kind == "CALIBRATION"
+            and it.parent_cert_no not in by_no
+            and it.parent_cert_no not in found
+        ):
+            raise ApiError(
+                422,
+                "invalid_reference",
+                f"证书 {it.cert_no} 引用的标准证书不存在: {it.parent_cert_no}",
+                details={"cert_no": it.cert_no, "parent_cert_no": it.parent_cert_no},
+            )
+    # 4) 批内引用无环并拓扑排序（列表顺序不代表引用顺序）
+    return _topo_sort_batch(items)
+
+
+def _insert_batch_items(conn, ordered: list) -> None:
+    """按拓扑序逐张校验并插入，复用单张签发的全部规则（上游有效性、区间重叠）。
+
+    批内上游先于下游插入，因此下游对“本批证书”的引用与对库内证书的引用
+    走完全相同的校验路径。数据库层唯一/排他冲突不在此转换，交由批次级统一
+    处理，以便区分“并发同键重放”与“真实冲突”。
+    """
+    for it in ordered:
+        try:
+            if it.kind == "CALIBRATION":
+                _validate_parent(conn, it.parent_cert_no, it.calibrated_at)
+            _assert_no_overlap(
+                conn, it.device_id, it.valid_from, it.valid_to, it.cert_no
+            )
+        except ApiError as exc:
+            exc.details = {**exc.details, "cert_no": it.cert_no}
+            raise
+        _raw_insert_certificate(
+            conn,
+            kind=it.kind,
+            conclusion="PASS" if it.kind == "REFERENCE" else it.conclusion,
+            parent_no=None if it.kind == "REFERENCE" else it.parent_cert_no,
+            req=it,
+        )
+
+
+def _build_batch_response(conn, req, issued_at: datetime) -> dict:
+    """组装批次结果：批次键 + 各证书及其从基准到自身的追溯链（按请求顺序）。"""
+    items = []
+    for it in req.certificates:
+        items.append(
+            {
+                "certificate": get_certificate(conn, it.cert_no),
+                "chain": get_chain(conn, it.cert_no),
+            }
+        )
+    return {
+        "batch_key": req.batch_key,
+        "count": len(items),
+        "issued_at": issued_at,
+        "items": items,
+    }
+
+
+def _batch_cert_duplicate_error(conn, req) -> ApiError:
+    """唯一冲突且批次键不存在 → 与并发事务的证书编号冲突，定位冲突编号。"""
+    nos = [it.cert_no for it in req.certificates]
+    existing = {
+        r["cert_no"]
+        for r in conn.execute(
+            "SELECT cert_no FROM certificates WHERE cert_no = ANY(%s)", (nos,)
+        ).fetchall()
+    }
+    for it in req.certificates:
+        if it.cert_no in existing:
+            return ApiError(
+                409,
+                "cert_duplicate",
+                f"证书编号已存在: {it.cert_no}（与并发签发冲突，整批未签发）",
+                details={"cert_no": it.cert_no},
+            )
+    return ApiError(
+        409, "cert_duplicate", f"批次 {req.batch_key} 与并发签发冲突，整批未签发"
+    )
+
+
+def _batch_overlap_error(conn, req) -> ApiError:
+    """排他约束兜底：与并发事务（单张签发或另一批次）在同设备有效期上重叠。"""
+    for it in req.certificates:
+        row = conn.execute(
+            """
+            SELECT cert_no FROM certificates
+            WHERE device_id = %s AND status = 'ACTIVE'
+              AND tstzrange(valid_from, valid_to, '[)') && tstzrange(%s, %s, '[)')
+            LIMIT 1
+            """,
+            (it.device_id, it.valid_from, it.valid_to),
+        ).fetchone()
+        if row:
+            return ApiError(
+                409,
+                "validity_overlap_concurrent",
+                f"设备 {it.device_id} 已生效证书 {row['cert_no']} 与证书 {it.cert_no} "
+                "的有效期重叠（并发签发冲突，整批未签发）",
+                details={"cert_no": it.cert_no, "conflict_cert_no": row["cert_no"]},
+            )
+    return ApiError(
+        409,
+        "validity_overlap_concurrent",
+        f"批次 {req.batch_key} 与并发签发在有效期上重叠，整批未签发",
+    )
+
+
+def issue_batch(conn, req) -> tuple[dict, bool]:
+    """批量签发交接批次，返回 (响应体, 是否首次签发)。
+
+    - 整批原子：任一记录不合规 → 全部回滚，响应以 details.cert_no 定位出错编号及原因；
+    - 批次键幂等：同键同请求 → 重放首次签发结果快照（即使证书事后被撤销）；
+      同键不同请求 → 409 batch_conflict；
+    - 并发同键提交由 issue_batches 主键兜底：后到事务回滚后按已提交结果重放/判冲突；
+    - 与单张签发、撤销并发时，沿用同一套行锁、唯一约束与排他约束，规则一致。
+    """
+    req_hash, request_doc = _canonical_request(req)
+    try:
+        with conn.transaction():
+            existing = _get_issue_batch_row(conn, req.batch_key)
+            if existing is not None:
+                return _replay_or_conflict(existing, req.batch_key, req_hash), False
+            ordered = _validate_batch(conn, req)
+            _insert_batch_items(conn, ordered)
+            issued_at = datetime.now(timezone.utc)
+            response = _build_batch_response(conn, req, issued_at)
+            conn.execute(
+                """
+                INSERT INTO issue_batches
+                    (batch_key, request_hash, request, response, cert_nos, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    req.batch_key,
+                    req_hash,
+                    Jsonb(request_doc),
+                    Jsonb(response, dumps=_json_dumps),
+                    [it.cert_no for it in req.certificates],
+                    issued_at,
+                ),
+            )
+            return response, True
+    except psycopg.errors.UniqueViolation:
+        # 事务已整体回滚：并发同键提交，或与并发事务的证书编号冲突
+        existing = _get_issue_batch_row(conn, req.batch_key)
+        if existing is not None:
+            return _replay_or_conflict(existing, req.batch_key, req_hash), False
+        raise _batch_cert_duplicate_error(conn, req)
+    except psycopg.errors.ExclusionViolation:
+        raise _batch_overlap_error(conn, req)
+    except psycopg.errors.ForeignKeyViolation:
+        raise ApiError(
+            422, "invalid_reference", "引用的标准证书不存在（并发变更），整批未签发"
+        )
+    except psycopg.errors.CheckViolation as exc:
+        raise ApiError(422, "rule_violation", f"签发被数据库完整性规则拒绝: {exc}")
+
+
+def get_issue_batch(conn, batch_key: str) -> dict:
+    """按批次键查询首次签发结果（与签发响应同构的快照）。"""
+    row = _get_issue_batch_row(conn, batch_key)
+    if row is None:
+        raise ApiError(404, "batch_not_found", f"签发批次不存在: {batch_key}")
+    return row["response"]
 
 
 # ---------------------------------------------------------------------------

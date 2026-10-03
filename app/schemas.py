@@ -52,6 +52,49 @@ class RevokeRequest(BaseModel):
     operator: str | None = Field(None, max_length=128)
 
 
+class BatchIssueItem(_IssueBase):
+    """批次中的单张证书，沿用单张签发的字段与规则。
+
+    kind=REFERENCE   基准设备合格证书（追溯起点）：不得填写 parent_cert_no，
+                     结论恒为 PASS（conclusion 可省略或显式传 "PASS"）。
+    kind=CALIBRATION 普通校准证书：parent_cert_no 与 conclusion 必填；
+                     parent_cert_no 可引用库内已有证书或本批证书。
+    """
+    kind: CertKind = Field(..., description="REFERENCE=基准证书；CALIBRATION=普通校准证书")
+    conclusion: CertConclusion | None = Field(
+        None, description="校准结论；基准证书恒为 PASS，普通证书必填"
+    )
+    parent_cert_no: str | None = Field(
+        None, description="引用的上游证书编号（库内或本批）；普通证书必填"
+    )
+
+    @model_validator(mode="after")
+    def _check_kind_fields(self):
+        if self.kind == "REFERENCE":
+            if self.parent_cert_no is not None:
+                raise ValueError("基准证书(REFERENCE)不得填写 parent_cert_no")
+            if self.conclusion not in (None, "PASS"):
+                raise ValueError("基准证书结论恒为合格(PASS)，不得指定其他结论")
+        else:
+            if not self.parent_cert_no:
+                raise ValueError("普通校准证书(CALIBRATION)必须填写 parent_cert_no")
+            if self.conclusion is None:
+                raise ValueError("普通校准证书(CALIBRATION)必须填写 conclusion")
+        return self
+
+
+class BatchIssueRequest(BaseModel):
+    """离线采集交接批次：唯一批次键 + 非空证书列表（列表顺序不代表引用顺序）。"""
+    batch_key: str = Field(
+        ..., min_length=1, max_length=128,
+        description="批次键（幂等键）：同键同请求重放首次签发结果，同键不同请求报冲突",
+    )
+    certificates: list[BatchIssueItem] = Field(
+        ..., min_length=1, max_length=500,
+        description="本批证书列表（非空）；列表顺序不代表引用顺序",
+    )
+
+
 class CertificateOut(BaseModel):
     cert_no: str
     kind: CertKind
@@ -85,6 +128,20 @@ class TraceChainOut(BaseModel):
 class IssueResponse(BaseModel):
     certificate: CertificateOut
     chain: TraceChainOut
+
+
+class BatchIssueItemOut(BaseModel):
+    certificate: CertificateOut
+    chain: TraceChainOut
+
+
+class BatchIssueResponse(BaseModel):
+    batch_key: str
+    count: int
+    issued_at: datetime
+    items: list[BatchIssueItemOut] = Field(
+        ..., description="各证书及其从基准到自身的追溯链，按请求列表顺序返回"
+    )
 
 
 class InvalidatedItem(BaseModel):

@@ -12,6 +12,19 @@ logger = logging.getLogger("caltrace")
 
 _pool: ConnectionPool | None = None
 
+# 幂等结构补丁：为沿用旧数据卷的部署补充后续版本新增的表。
+# 与 db/init.sql 中同名表定义保持一致（全新数据卷由 init.sql 建表，此处为 no-op）。
+_MIGRATION_SQL = """
+CREATE TABLE IF NOT EXISTS issue_batches (
+    batch_key    TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    request      JSONB NOT NULL,
+    response     JSONB NOT NULL,
+    cert_nos     TEXT[] NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
 
 def _build_dsn() -> str:
     return (
@@ -57,6 +70,14 @@ def close_pool() -> None:
     if _pool is not None:
         _pool.close()
         _pool = None
+
+
+def ensure_schema(pool: ConnectionPool) -> None:
+    """启动时执行幂等结构补丁（不改动既有表与数据）。"""
+    with pool.connection() as conn:
+        with conn.transaction():
+            conn.execute(_MIGRATION_SQL)
+    logger.info("schema migration ensured")
 
 
 def get_pool() -> ConnectionPool:

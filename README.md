@@ -2,7 +2,8 @@
 
 可离线运行的计量校准证书签发与**量值溯源链**管理服务。以基准（标准）设备的合格证书为
 追溯起点，普通校准证书必须引用一张在**校准时刻有效且合格**的标准设备证书；撤销上游
-证书时，其全部下游证书级联失效。
+证书时，其全部下游证书级联失效。离线采集的校准记录可作为**交接批次**整批签发：
+批次键幂等、整批原子落库、批内证书可相互引用。
 
 - 技术栈：Python 3.11 · FastAPI · PostgreSQL 16 · psycopg3
 - 关键业务不变量由**数据库约束 + 触发器 + 单事务**保证，不依赖应用层“先查后写”，
@@ -22,7 +23,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、签发批次表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -114,6 +115,14 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
    - 撤销与新签发并发 → 撤销事务持有被撤销证书行锁与全部下游行锁，
      新引用插入的外键检查会阻塞到撤销提交，随后按“引用已失效”被拒绝，
      不会出现“失效证书还能被引用”的窗口。
+8. **批次签发（离线交接）**：`POST /api/v1/certificate-batches` 携带唯一批次键与
+   非空证书列表，每项沿用单张签发的全部字段与规则；普通证书可引用库内证书或
+   本批证书（**列表顺序不代表引用顺序**，服务按引用拓扑排序后逐张校验落库）。
+   批内编号唯一、引用无环、上游当前生效且合格且校准时刻落在其有效期内、同设备
+   生效有效期不重叠——**任一记录不合规则整批不落库**，错误响应以
+   `details.cert_no` 定位出错编号。批次键为幂等键：同键同请求重放首次签发结果
+   快照（即使证书事后被撤销），同键不同请求返回 `409 batch_conflict`；
+   并发重复提交由批次键主键兜底，仅一个事务真正落库。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -230,6 +239,66 @@ curl -sS http://localhost:8080/api/v1/revocations
 curl -sS http://localhost:8080/api/v1/revocations/1
 ```
 
+### 7. 批量签发交接批次（整批原子、批次键幂等）
+
+离线采集的一组校准记录作为一个交接批次一次签发。每项通过 `kind` 区分基准
+（`REFERENCE`）或普通（`CALIBRATION`）证书，字段与单张签发一致；普通证书的
+`parent_cert_no` 可引用库内证书或本批证书，**列表顺序不代表引用顺序**：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/certificate-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "batch_key": "HANDOFF-2026-10-03-001",
+    "certificates": [
+      {"kind": "CALIBRATION", "cert_no": "CAL-B-002", "device_id": "DEV-B-2",
+       "valid_from": "2026-05-01T00:00:00+08:00", "valid_to": "2027-05-01T00:00:00+08:00",
+       "calibrated_at": "2026-05-02T09:00:00+08:00", "conclusion": "PASS",
+       "parent_cert_no": "CAL-B-001"},
+      {"kind": "REFERENCE", "cert_no": "REF-B-000", "device_id": "DEV-B-0",
+       "valid_from": "2026-01-01T00:00:00+08:00", "valid_to": "2027-01-01T00:00:00+08:00",
+       "calibrated_at": "2026-01-01T09:00:00+08:00"},
+      {"kind": "CALIBRATION", "cert_no": "CAL-B-001", "device_id": "DEV-B-1",
+       "valid_from": "2026-03-01T00:00:00+08:00", "valid_to": "2027-03-01T00:00:00+08:00",
+       "calibrated_at": "2026-03-02T09:00:00+08:00", "conclusion": "PASS",
+       "parent_cert_no": "REF-B-000"}
+    ]
+  }'
+```
+
+首次成功响应 `201`（`items` 按请求列表顺序返回，各含从基准到自身的追溯链）：
+
+```json
+{
+  "batch_key": "HANDOFF-2026-10-03-001",
+  "count": 3,
+  "issued_at": "2026-10-03T10:20:30.123456+00:00",
+  "items": [
+    {"certificate": {"cert_no": "CAL-B-002", ...},
+     "chain": {"cert_no": "CAL-B-002", "root_cert_no": "REF-B-000", "length": 3, "nodes": [...]}},
+    {"certificate": {"cert_no": "REF-B-000", ...}, "chain": {...}},
+    {"certificate": {"cert_no": "CAL-B-001", ...}, "chain": {...}}
+  ]
+}
+```
+
+幂等与冲突约定：
+
+- **同键同请求重试** → `200`，返回首次签发结果快照（即使证书事后被撤销）；
+- **同键不同请求** → `409 batch_conflict`；
+- **任一记录不合规** → 整批不落库，错误响应 `details.cert_no` 定位出错编号，
+  错误码与单张签发一致（如 `reference_not_active`、`validity_overlap`），
+  批内特有问题使用 `batch_cert_duplicate`（批内编号重复）与
+  `reference_cycle`（批内引用成环）。
+
+### 8. 查询签发批次（首次签发结果快照）
+
+```bash
+curl -sS http://localhost:8080/api/v1/certificate-batches/HANDOFF-2026-10-03-001 | python3 -m json.tool
+```
+
+返回与签发响应同构的快照，不受事后撤销影响；批次不存在返回 `404 batch_not_found`。
+
 ---
 
 ## 错误响应
@@ -238,28 +307,36 @@ curl -sS http://localhost:8080/api/v1/revocations/1
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` | 目标不存在 |
-| 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发） |
-| 422 | `invalid_reference` | 引用的标准证书不存在 |
+| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` | 目标不存在 |
+| 409 | `cert_duplicate` | 证书编号已存在（含并发重复签发、批次与库内冲突） |
+| 409 | `batch_conflict` | 同一批次键提交了内容不同的签发请求 |
+| 422 | `batch_cert_duplicate` | 批次内证书编号重复 |
+| 422 | `invalid_reference` | 引用的标准证书不存在（库内与本批均找不到） |
 | 422 | `reference_not_active` | 引用了已撤销/已失效证书（失效证书不得作依据） |
 | 422 | `reference_not_qualified` | 引用的标准证书结论为不合格 |
 | 422 | `reference_out_of_validity` | 校准时刻不在标准证书有效期内 |
-| 422 | `reference_cycle` | 引用关系将形成环路 |
-| 422 | `validity_overlap` | 同设备已生效证书有效期重叠 |
+| 422 | `reference_cycle` | 引用关系将形成环路（含批内成环） |
+| 422 | `validity_overlap` | 同设备已生效证书有效期重叠（含批内重叠） |
 | 409 | `validity_overlap_concurrent` | 并发签发重叠，排他约束兜底拒绝 |
 | 409 | `cert_not_active` | 撤销一张非 ACTIVE 证书 |
+
+> 批次签发中由单条记录触发的校验错误与单张签发同码，并在 `details.cert_no`
+> 中给出出错证书编号（必要时附 `details.parent_cert_no` / `details.cycle` 等）。
 
 ---
 
 ## 自测
 
-服务启动后执行（仅依赖 bash + curl）：
+服务启动后执行（仅依赖 bash + curl / python3 标准库）：
 
 ```bash
 scripts/smoke-test.sh                 # 17 项主流程与错误路径
 python3 scripts/extra_checks.py       # 21 项并发/边界/中段撤销补充检查
+python3 scripts/batch_checks.py       # 批次签发：原子性/乱序引用/幂等重放/键冲突/并发
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
 同编号并发与重叠区间并发（3 线程仅 1 成功）、中段撤销、级联失效、失效证书
-禁止引用、撤销后重签、历史可查、撤销批次回放，以及数据库层 UPDATE/DELETE 封印。
+禁止引用、撤销后重签、历史可查、撤销批次回放，数据库层 UPDATE/DELETE 封印，
+以及批次签发的整批原子性、批内乱序引用与拓扑校验、同键重放（含事后撤销）、
+同键冲突、并发重复提交（5 线程仅 1 次首次签发）与批次查询。
